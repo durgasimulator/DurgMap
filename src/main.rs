@@ -75,27 +75,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Using game path: {}", game_path);
     let json_path: PathBuf = format_json_path(args.json_path)?;
 
-    unsafe {
-        let mut client = D2Client::new();
+    // D2's level generation recurses very deeply for some maps. The OS default main-thread
+    // stack (~1 MB, and smaller/stricter under the 32-bit Wine build) overflows mid-generation
+    // and aborts the whole process — observed as `thread 'main' has overflowed its stack` with
+    // the faulting address inside a D2 DLL, followed by a crash/restart loop.
+    //
+    // Run ALL D2 work on one dedicated thread with a large stack. It must be a SINGLE thread:
+    // the D2 game DLLs are not thread-safe and rely on per-thread state established by
+    // `initialize`, so init + every request must share the same thread (as before — just with
+    // a bigger stack).
+    const D2_STACK_SIZE: usize = 64 * 1024 * 1024; // 64 MB reserved (committed on demand)
+    let seed_arg = args.seed;
+    let act_arg = args.act;
+    let map_arg = args.map;
+    let difficulty = args.difficulty;
 
-        let init_start = Instant::now();
-        client.initialize(&game_path)?;
-        let init_duration = init_start.elapsed();
-        log::info!(
-            "Initialization complete, version: {}, duration: {}ms",
-            VERSION,
-            init_duration.as_millis()
-        );
+    let worker = std::thread::Builder::new()
+        .name("d2-map".into())
+        .stack_size(D2_STACK_SIZE)
+        .spawn(move || -> Result<(), String> {
+            unsafe {
+                let mut client = D2Client::new();
 
-        if args.seed.is_some() || args.act.is_some() || args.map.is_some() {
-            let seed = args.seed.unwrap_or(0xff00ff00);
-            dump_maps(&mut client, seed, args.difficulty, args.act, args.map, json_path);
-            return Ok(());
-        }
+                let init_start = Instant::now();
+                client.initialize(&game_path).map_err(|e| e.to_string())?;
+                log::info!(
+                    "Initialization complete, version: {}, duration: {}ms",
+                    VERSION,
+                    init_start.elapsed().as_millis()
+                );
 
-        // No one-shot dump requested: run as a resident HTTP map server on port 8000.
-        http::serve(&mut client, SERVER_PORT)?;
-    }
+                if seed_arg.is_some() || act_arg.is_some() || map_arg.is_some() {
+                    let seed = seed_arg.unwrap_or(0xff00ff00);
+                    dump_maps(&mut client, seed, difficulty, act_arg, map_arg, json_path);
+                    return Ok(());
+                }
+
+                // No one-shot dump requested: run as a resident HTTP map server on port 8000.
+                http::serve(&mut client, SERVER_PORT).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })?;
+
+    // Propagate a clean error for a worker panic or an inner failure.
+    worker
+        .join()
+        .map_err(|_| "d2-map worker thread panicked".to_string())??;
 
     Ok(())
 }
